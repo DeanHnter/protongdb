@@ -30,6 +30,24 @@ except ImportError as exc:
 
 logger = logging.getLogger("protongdb")
 
+DEFAULT_STARTUP_SKIP_FUNCTIONS = (
+    "_start",
+    "__libc_start_main",
+    "wld_start",
+    "loader_exec",
+    "loader_init",
+    "call_init",
+    "start_process",
+    "__wine_main",
+    "__wine_init_unix_call",
+    "__wine_spec_exe_entry",
+    "__wine_spec_dll_entry",
+    "signal_start_thread",
+    "start_thread",
+    "BaseThreadInitThunk",
+    "RtlUserThreadStart",
+)
+
 
 def enable_logging(info=False):
     level = logging.INFO if info else logging.WARNING
@@ -145,6 +163,17 @@ def tail_file_lines(path, max_lines=80, block_size=8192):
     return data.decode("utf-8", "replace").splitlines()[-max_lines:]
 
 
+def unique_preserving_order(items):
+    seen = set()
+    unique = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
 def verify_tools():
     required = ["gdb"]
     missing = []
@@ -167,9 +196,20 @@ def download_winereload():
     return dest
 
 
-def write_gdb_script(path: Path, log_path: Path, extra_breaks=None, auto_run=False):
+def write_gdb_script(
+    path: Path,
+    log_path: Path,
+    extra_breaks=None,
+    auto_run=False,
+    skip_functions=None,
+    skip_files=None,
+):
     if extra_breaks is None:
         extra_breaks = []
+    if skip_functions is None:
+        skip_functions = []
+    if skip_files is None:
+        skip_files = []
 
     lp = str(log_path).replace("\\", "\\\\")
 
@@ -216,6 +256,25 @@ def write_gdb_script(path: Path, log_path: Path, extra_breaks=None, auto_run=Fal
     ])
 
     cmds.extend(extra_breaks)
+
+    # Apply skip rules without aborting startup when a symbol or file is unavailable.
+    cmds.extend([
+        "python",
+        "import gdb",
+        f"_protongdb_skip_functions = {repr(list(skip_functions))}",
+        f"_protongdb_skip_files = {repr(list(skip_files))}",
+        "for _spec in _protongdb_skip_functions:",
+        "    try:",
+        "        gdb.execute('skip function ' + _spec, from_tty=False, to_string=True)",
+        "    except gdb.error:",
+        "        pass",
+        "for _spec in _protongdb_skip_files:",
+        "    try:",
+        "        gdb.execute('skip file ' + _spec, from_tty=False, to_string=True)",
+        "    except gdb.error:",
+        "        pass",
+        "end",
+    ])
 
     # Helper command: dump current debugger state to log
     cmds.extend([
@@ -296,8 +355,18 @@ def write_gdb_script(path: Path, log_path: Path, extra_breaks=None, auto_run=Fal
         "end",
     ])
 
+    cmds.extend([
+        "define skips",
+        "  info skip",
+        "end",
+        "document skips",
+        "Show active protongdb skip rules.",
+        "end",
+    ])
+
     cmds.append('echo Logging enabled. GDB log file: ' + lp + '\\n')
     cmds.append('echo Use "run" to start. Use "ilog", "slog", "nlog", "silog", "nilog", or "clog".\\n')
+    cmds.append('echo Wine/Proton startup skips applied. Use "skips" or "info skip" to inspect them.\\n')
     cmds.append('echo On crash, run "wine-reload" then "thread apply all bt full".\\n')
 
     if auto_run:
@@ -374,12 +443,16 @@ def build_launch_context(args):
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_path = log_dir / f"protongdb-{args.appid}-{ts}.log"
     gdb_script_path = Path("/tmp/.protongdb_gdbinit")
+    skip_functions = build_skip_function_list(args)
+    skip_files = unique_preserving_order(args.skip_file)
 
     write_gdb_script(
         gdb_script_path,
         log_path=log_path,
         extra_breaks=args.breakpoint,
         auto_run=args.auto_run,
+        skip_functions=skip_functions,
+        skip_files=skip_files,
     )
 
     executable_path = game_app.install_path / launch_executable_rel
@@ -449,6 +522,8 @@ def build_launch_context(args):
         "gdb_script_path": gdb_script_path,
         "log_path": log_path,
         "proton_app": proton_app,
+        "skip_files": skip_files,
+        "skip_functions": skip_functions,
         "working_dir": working_dir,
     }
 
@@ -465,13 +540,18 @@ def print_launch_summary(context, ui_enabled):
     print("--------------------------------------------")
     print(f"GDB log file: {context['log_path']}")
     print(f"Debugger UI: {'enabled' if ui_enabled else 'disabled'}")
+    if context["skip_functions"] or context["skip_files"]:
+        print(
+            f"Startup skips: {len(context['skip_functions'])} function rules, "
+            f"{len(context['skip_files'])} file rules"
+        )
     print()
 
     if ui_enabled:
         print("UI hotkeys:")
         print("  r run, c continue, s step, n next")
         print("  i stepi, o nexti, l ilog, b backtrace, t all-thread backtrace")
-        print("  d disassemble around $pc, y info symbol $pc, w wine-reload")
+        print("  d disassemble around $pc, y info symbol $pc, k show skip rules, w wine-reload")
         print("  p interrupt, : custom gdb command, q quit")
     else:
         print("Inside GDB:")
@@ -482,6 +562,7 @@ def print_launch_summary(context, ui_enabled):
         print("  silog    -> dump state, then stepi")
         print("  nilog    -> dump state, then nexti")
         print("  clog     -> dump state, then continue")
+        print("  skips    -> show active skip rules")
 
     print()
     print("Launching GDB:")
@@ -767,6 +848,8 @@ class DebuggerUI(object):
             ),
             ord("y"): (["info symbol $pc"], False, "Looking up the current symbol."),
             ord("Y"): (["info symbol $pc"], False, "Looking up the current symbol."),
+            ord("k"): (["skips"], False, "Listing active skip rules."),
+            ord("K"): (["skips"], False, "Listing active skip rules."),
             ord("w"): (["wine-reload"], False, "Reloading Wine symbols."),
             ord("W"): (["wine-reload"], False, "Reloading Wine symbols."),
         }
@@ -879,7 +962,7 @@ class DebuggerUI(object):
             )
 
         footer_y = height - footer_height
-        help_line = "r run | c continue | s step | n next | i stepi | o nexti | l log | b bt | d disasm | : cmd | q quit"
+        help_line = "r run | c continue | s step | n next | i stepi | o nexti | k skips | : cmd | q quit"
         try:
             stdscr.addnstr(footer_y, 0, help_line, max(width - 1, 0), curses.A_REVERSE)
         except curses.error:
@@ -931,7 +1014,7 @@ class DebuggerUI(object):
             "r run | c clog | s slog | n nlog",
             "i silog | o nilog | l ilog",
             "b bt | t thread apply all bt full",
-            "d inspect $pc | y info symbol $pc",
+            "d inspect $pc | y info symbol $pc | k skips",
             "w wine-reload | p interrupt | : raw command | q quit",
             "",
             f"Last command: {last_command}",
@@ -941,6 +1024,14 @@ class DebuggerUI(object):
 
 def launch_gdb_ui(context):
     return DebuggerUI(context).run()
+
+
+def build_skip_function_list(args):
+    skip_functions = []
+    if not args.no_default_skips:
+        skip_functions.extend(DEFAULT_STARTUP_SKIP_FUNCTIONS)
+    skip_functions.extend(args.skip_function)
+    return unique_preserving_order(skip_functions)
 
 
 def main(args=None):
@@ -953,6 +1044,23 @@ def main(args=None):
     parser.add_argument("--breakpoint", "-b", action="append", default=[], help="extra breakpoint to set in gdb")
     parser.add_argument("--force-windowed", action="store_true", default=True, help="add common windowed launch args")
     parser.add_argument("--log-dir", default=".", help="directory for gdb log output")
+    parser.add_argument(
+        "--skip-function",
+        action="append",
+        default=[],
+        help="extra GDB function/linespec to skip while stepping",
+    )
+    parser.add_argument(
+        "--skip-file",
+        action="append",
+        default=[],
+        help="extra GDB file/glob to skip while stepping",
+    )
+    parser.add_argument(
+        "--no-default-skips",
+        action="store_true",
+        help="disable the built-in Wine/Proton startup skip list",
+    )
     ui_group = parser.add_mutually_exclusive_group()
     ui_group.add_argument("--ui", dest="ui", action="store_true", help="launch the built-in debugger UI (default on TTYs)")
     ui_group.add_argument("--no-ui", dest="ui", action="store_false", help="launch plain gdb without the built-in UI")

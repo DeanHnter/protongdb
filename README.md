@@ -27,6 +27,8 @@ You can then get a backtrace or step-through the code like a native app.
 
 Unlike Steam, environment variables are inherited from your environment, so specify them before `protongdb` (no need for `%command%` stuff).
 
+By default, `protongdb` also installs a Wine/Proton startup skip list in GDB so `step` / `next` are less likely to walk through loader and thread bootstrap glue before you reach game code. Use `--no-default-skips` to disable that, `--skip-function NAME` to add more skipped functions, and `--skip-file GLOB` to add skipped source files or file globs.
+
 ## Debugger UI
 
 The built-in UI gives you hotkeys for the common debugger actions so you do not have to keep typing commands:
@@ -42,6 +44,7 @@ The built-in UI gives you hotkeys for the common debugger actions so you do not 
 - `t` `thread apply all bt full`
 - `d` inspect the current PC with symbol lookup and disassembly
 - `y` `info symbol $pc`
+- `k` show active skip rules
 - `w` `wine-reload`
 - `p` interrupt the inferior
 - `:` enter a raw GDB command
@@ -63,6 +66,14 @@ source-level `step` / `next` are no longer reliable. Use instruction-level stepp
 - `nilog` to dump state and run `nexti`
 
 The built-in UI exposes those as `i` and `o`.
+
+## Skip Rules
+
+The default startup skip list targets common loader and thread-entry wrappers such as `_start`, `wld_start`, `__libc_start_main`, `__wine_main`, `__wine_spec_exe_entry`, `start_thread`, `BaseThreadInitThunk`, and `RtlUserThreadStart`.
+
+This only changes stepping behavior. It helps `step` / `next` avoid descending into Wine/Proton glue, but it does not prevent that code from running and it does not suppress normal breakpoint or catchpoint stops.
+
+Use `skips` or `info skip` inside GDB, or press `k` in the UI, to inspect the active rules.
 
 ## Special Thanks
 

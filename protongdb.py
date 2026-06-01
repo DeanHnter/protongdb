@@ -104,6 +104,7 @@ def write_gdb_script(path: Path, auto_continue=False, extra_breaks=None):
         "set pagination off",
         "set print thread-events off",
         "set breakpoint pending on",
+        "set debuginfod enabled off",
         "set detach-on-fork off",
         "set follow-fork-mode child",
         "handle SIGUSR1 noprint nostop pass",
@@ -129,7 +130,7 @@ def write_gdb_script(path: Path, auto_continue=False, extra_breaks=None):
 
     gdb_commands.extend(extra_breaks)
 
-    gdb_commands.append('echo Attached and target is stopped. Use "continue", "step", or "next".\\n')
+    gdb_commands.append('echo GDB attached. Target should be stopped now. Use "continue", "step", or "next".\\n')
     gdb_commands.append('echo On crash, run "wine-reload" and then "thread apply all bt full".\\n')
 
     if auto_continue:
@@ -233,6 +234,8 @@ def main(args=None):
     parser.add_argument("--attach-timeout", type=float, default=15.0)
     parser.add_argument("--auto-continue", action="store_true", help="automatically continue after attach")
     parser.add_argument("--breakpoint", "-b", action="append", default=[], help="extra breakpoint to set in gdb")
+    parser.add_argument("--force-windowed", action="store_true", default=True,
+                        help="add common windowed launch args")
     parser.add_argument("appid", type=int, nargs="?", default=None)
     parser.add_argument("app_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(args)
@@ -289,19 +292,8 @@ def main(args=None):
         logger.error("Cannot find launch executable from %s", appinfo_path)
         return 1
 
-    if len(app_infos) == 1:
-        _, working_dir_rel, launch_executable_rel, beta_key, app_config_args = app_infos[0]
-    else:
-        print("Available launch configurations:")
-        for x, info in enumerate(app_infos):
-            description, working_dir_rel, launch_executable_rel, beta_key, app_config_args = info
-            beta_str = f" | Beta: {beta_key} |" if beta_key else ""
-            print(f"[{x}] {description} ({launch_executable_rel}{list_to_space_str_prefix(app_config_args, ' ')}){beta_str}")
-        config_idx = safe_cast(input("Select a game configuration to run: "), int)
-        if config_idx is None or config_idx not in range(0, len(app_infos)):
-            logger.error("Invalid app configuration.")
-            return 1
-        _, working_dir_rel, launch_executable_rel, beta_key, app_config_args = app_infos[config_idx]
+    # Auto-select launch config 0 if multiple exist
+    _, working_dir_rel, launch_executable_rel, beta_key, app_config_args = app_infos[0]
 
     try:
         download_winereload()
@@ -313,7 +305,16 @@ def main(args=None):
 
     executable_path = game_app.install_path / launch_executable_rel
     working_dir = game_app.install_path / working_dir_rel if working_dir_rel else game_app.install_path
-    app_args = app_config_args + args.app_args
+
+    forced_windowed_args = []
+    if args.force_windowed:
+        # Common but not universal. Some games ignore some/all of these.
+        forced_windowed_args = [
+            "-windowed",
+            "-noborder",
+        ]
+
+    app_args = app_config_args + forced_windowed_args + args.app_args
 
     print(f"Proton: {proton_app.name} ({proton_app.appid})")
     print(f"App: {game_app.name} ({game_app.appid})")
@@ -379,7 +380,6 @@ def main(args=None):
         logger.error("Couldn't find a suitable PID to attach for %s", exe_name)
         return 1
 
-    # ALWAYS choose candidate 0. No prompt.
     chosen = candidates[0]
 
     print("\nAuto-selected candidate [0]:")

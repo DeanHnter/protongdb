@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-# Debug a Steam Play/Proton game by launching it UNDER GDB from the start.
-#
-# This avoids the race of "launch, find pid, attach later".
-# It launches wine under gdb and stops at exec before the Windows program runs.
-#
-# Depends on ProtonTricks (GPLv3), so this script is GPLv3 as well.
-
 import argparse
+import datetime
 import logging
 import os
 import shlex
@@ -79,13 +73,6 @@ def shell_join(args):
     return " ".join(shlex.quote(str(x)) for x in args)
 
 
-def safe_cast(val, to_type, default=None):
-    try:
-        return to_type(val)
-    except (ValueError, TypeError):
-        return default
-
-
 def verify_tools():
     required = ["gdb"]
     missing = []
@@ -108,9 +95,11 @@ def download_winereload():
     return dest
 
 
-def write_gdb_script(path: Path, extra_breaks=None, auto_continue=False):
+def write_gdb_script(path: Path, log_path: Path, extra_breaks=None, auto_run=False):
     if extra_breaks is None:
         extra_breaks = []
+
+    lp = str(log_path).replace("\\", "\\\\")
 
     cmds = [
         "set confirm off",
@@ -121,6 +110,14 @@ def write_gdb_script(path: Path, extra_breaks=None, auto_continue=False):
         "set detach-on-fork off",
         "set follow-fork-mode child",
         "set follow-exec-mode new",
+        "set print pretty on",
+        "set print object on",
+        "set print elements 200",
+        "set disassemble-next-line on",
+        "set logging file " + lp,
+        "set logging overwrite on",
+        "set logging redirect off",
+        "set logging enabled on",
         "catch exec",
         "catch fork",
         "catch vfork",
@@ -138,7 +135,6 @@ def write_gdb_script(path: Path, extra_breaks=None, auto_continue=False):
     if os.path.exists("/tmp/winereload.py"):
         cmds.append("source /tmp/winereload.py")
 
-    # Pending breakpoints: if symbols appear later, gdb will bind them.
     cmds.extend([
         "break main",
         "break WinMain",
@@ -149,11 +145,67 @@ def write_gdb_script(path: Path, extra_breaks=None, auto_continue=False):
 
     cmds.extend(extra_breaks)
 
-    cmds.append('echo Launched under GDB. Target is stopped under debugger control.\\n')
-    cmds.append('echo Use "run" to start, then "step"/"next"/"continue".\\n')
-    cmds.append('echo On crash, run "wine-reload" and then "thread apply all bt full".\\n')
+    # Helper command: dump current debugger state to log
+    cmds.extend([
+        "define ilog",
+        "  echo \\n========== ILOG STATE DUMP ==========\n",
+        "  printf \"PID/TID state dump\\n\"",
+        "  info program",
+        "  info inferiors",
+        "  info threads",
+        "  thread",
+        "  frame",
+        "  where 20",
+        "  info args",
+        "  info locals",
+        "  info registers",
+        "  x/16i $pc",
+        "  x/32gx $sp",
+        "  echo \\n========== END ILOG ==========\n",
+        "end",
+        "document ilog",
+        "Dump current execution state, stack, registers, locals, args, and nearby code.",
+        "end",
+    ])
 
-    if auto_continue:
+    # Step + log
+    cmds.extend([
+        "define slog",
+        "  ilog",
+        "  step",
+        "end",
+        "document slog",
+        "Dump state, then step.",
+        "end",
+    ])
+
+    # Next + log
+    cmds.extend([
+        "define nlog",
+        "  ilog",
+        "  next",
+        "end",
+        "document nlog",
+        "Dump state, then next.",
+        "end",
+    ])
+
+    # Continue + log
+    cmds.extend([
+        "define clog",
+        "  ilog",
+        "  continue",
+        "end",
+        "document clog",
+        "Dump state, then continue.",
+        "end",
+    ])
+
+    cmds.append('echo Logging enabled. GDB log file: ' + lp + '\\n')
+    cmds.append('echo Use "run" to start. Use "slog", "nlog", "clog", or "ilog".\\n')
+    cmds.append('echo On crash, run "wine-reload" then "thread apply all bt full".\\n')
+
+    if auto_run:
         cmds.append("run")
 
     with open(path, "w") as f:
@@ -163,19 +215,19 @@ def write_gdb_script(path: Path, extra_breaks=None, auto_continue=False):
 
 def main(args=None):
     parser = argparse.ArgumentParser(
-        description="Launch a Steam Play/Proton game under GDB from the start.",
+        description="Launch a Steam Play/Proton game under GDB and log debug state to a file.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="print debug information")
     parser.add_argument("--auto-run", action="store_true", help="automatically issue 'run' inside gdb")
     parser.add_argument("--breakpoint", "-b", action="append", default=[], help="extra breakpoint to set in gdb")
     parser.add_argument("--force-windowed", action="store_true", default=True, help="add common windowed launch args")
+    parser.add_argument("--log-dir", default=".", help="directory for gdb log output")
     parser.add_argument("appid", type=int, nargs="?", default=None)
     parser.add_argument("app_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(args)
 
     enable_logging(args.verbose)
-
     os.environ["DEBUGINFOD_URLS"] = ""
 
     if not args.appid:
@@ -228,7 +280,7 @@ def main(args=None):
         logger.error("Cannot find launch executable from %s", appinfo_path)
         return 1
 
-    # Always auto-select config 0
+    # Always auto-select launch config 0
     _, working_dir_rel, launch_executable_rel, beta_key, app_config_args = app_infos[0]
 
     try:
@@ -236,8 +288,18 @@ def main(args=None):
     except Exception as e:
         logger.warning("Failed to download WineReload.py: %s", e)
 
+    log_dir = Path(args.log_dir).expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = log_dir / f"protongdb-{args.appid}-{ts}.log"
     gdb_script_path = Path("/tmp/.protongdb_gdbinit")
-    write_gdb_script(gdb_script_path, extra_breaks=args.breakpoint, auto_continue=args.auto_run)
+
+    write_gdb_script(
+        gdb_script_path,
+        log_path=log_path,
+        extra_breaks=args.breakpoint,
+        auto_run=args.auto_run,
+    )
 
     executable_path = game_app.install_path / launch_executable_rel
     working_dir = game_app.install_path / working_dir_rel if working_dir_rel else game_app.install_path
@@ -260,11 +322,14 @@ def main(args=None):
     print(f"Using launch executable: {executable_path}")
     print(f"Using arguments: {list_to_space_str(app_args)}")
     print("--------------------------------------------")
-    print("This version launches the game under GDB from the beginning.")
-    print("That means startup code is under debugger control from the start.")
-    print("At the GDB prompt, use:")
-    print("  run")
-    print("then step/next/continue as needed.")
+    print(f"GDB log file: {log_path}")
+    print()
+    print("Inside GDB:")
+    print("  run      -> start the game")
+    print("  ilog     -> dump current state to log")
+    print("  slog     -> dump state, then step")
+    print("  nlog     -> dump state, then next")
+    print("  clog     -> dump state, then continue")
     print()
 
     env_vars = dict(os.environ)
@@ -300,7 +365,6 @@ def main(args=None):
     )
     env_vars.setdefault("WINE_GST_REGISTRY_DIR", f"{game_app.prefix_path}/gstreamer-1.0/")
 
-    # We debug wine itself from the start.
     wine_binary = f"{proton_app.install_path}/files/bin/wine"
     target_args = ["steam.exe", str(executable_path)] + app_args
 
@@ -314,12 +378,8 @@ def main(args=None):
         *target_args,
     ]
 
-    print("Launching GDB with command:")
+    print("Launching GDB:")
     print(" ", shell_join(gdb_cmd))
-    print()
-    print("Inside GDB:")
-    print("  run")
-    print("to start the game under debugger control.")
     print()
 
     rc = subprocess.call(
